@@ -1,0 +1,6 @@
+{
+  "name": "Asistencia Rafael Narváez",
+  "description": "Sistema de control de asistencia móvil para el Colegio Rafael Narváez Cadenillas.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": []
+}
