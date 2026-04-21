@@ -1,2 +1,2 @@
 # FrontedAsistencia
-# Fronted de la aplicaciòn de de asistencia aqutomatizada
+Fronted de la aplicaciòn de de asistencia aqutomatizada
