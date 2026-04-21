@@ -5,3 +5,14 @@
   --color-institucional-yellow: #fdb913;
   --color-institucional-light: #f8f9fa;
 }
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #f8f9fa;
+}
