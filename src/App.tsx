@@ -19,10 +19,11 @@ import {
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 
-const API_URL = import.meta.env.VITE_API_BASE_URL ?? '/api';
-const ENROLL_WEBHOOK_URL = `${API_URL.replace(/\/$/, '')}/enrolar`;
-const ATTENDANCE_WEBHOOK_URL = `${API_URL.replace(/\/$/, '')}/asistencia`;
-const PARENTS_WEBHOOK_URL = `${API_URL.replace(/\/$/, '')}/asistencia/padres`;
+const DATA_API_URL = import.meta.env.VITE_DATA_API_URL ?? import.meta.env.VITE_API_BASE_URL ?? '/api';
+const DATA_API_BASE = DATA_API_URL.replace(/\/$/, '');
+const ENROLL_WEBHOOK_URL = import.meta.env.VITE_ENROLL_WEBHOOK_URL ?? `${DATA_API_BASE}/enrolar`;
+const ATTENDANCE_WEBHOOK_URL = import.meta.env.VITE_ATTENDANCE_WEBHOOK_URL ?? `${DATA_API_BASE}/identificar`;
+const PARENTS_WEBHOOK_URL = import.meta.env.VITE_PARENTS_WEBHOOK_URL ?? `${DATA_API_BASE}/asistencia/padres`;
 
 interface Teacher {
   id_usuario: string;
@@ -42,6 +43,28 @@ interface Student {
   RekognitionId: string | null;
 }
 
+interface EnrollmentWebhookResponse {
+  id_alumno: string;
+  nombre_alumno: string;
+  id_padre: string;
+  id_tutor: string;
+  RekognitionId: string;
+  id: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface AttendanceWebhookResponse {
+  id_alumno: string;
+  estado: string;
+  hora_ingreso: string;
+  id_curso: string;
+  fecha_asistencia: string;
+  id: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 type AppStep = 'setup' | 'enrolling' | 'scanning';
 type EnrollmentStatus = 'idle' | 'sending' | 'success' | 'error';
 type AttendanceStatus = 'idle' | 'sending' | 'success' | 'error';
@@ -53,6 +76,50 @@ function stopStream(stream: MediaStream | null) {
 function extractBase64(dataUrl: string) {
   const separatorIndex = dataUrl.indexOf(',');
   return separatorIndex >= 0 ? dataUrl.slice(separatorIndex + 1) : dataUrl;
+}
+
+async function waitForVideoFrame(video: HTMLVideoElement) {
+  if (video.videoWidth > 0 && video.videoHeight > 0 && video.readyState >= 2) {
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('No se pudo obtener frame de video.'));
+    };
+
+    const onReady = () => {
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        finish();
+      }
+    };
+
+    const timeoutId = window.setTimeout(fail, 2500);
+
+    const cleanup = () => {
+      window.clearTimeout(timeoutId);
+      video.removeEventListener('loadeddata', onReady);
+      video.removeEventListener('canplay', onReady);
+      video.removeEventListener('error', fail);
+    };
+
+    video.addEventListener('loadeddata', onReady);
+    video.addEventListener('canplay', onReady);
+    video.addEventListener('error', fail);
+    onReady();
+  });
 }
 
 function readMaybeObject(value: unknown): Record<string, unknown> {
@@ -69,6 +136,53 @@ function readFirstString(payload: Record<string, unknown>, keys: string[]) {
   return '';
 }
 
+function parseEnrollmentResponse(payload: Record<string, unknown>): EnrollmentWebhookResponse | null {
+  const requiredStrings = ['id_alumno', 'nombre_alumno', 'id_padre', 'id_tutor', 'RekognitionId', 'createdAt', 'updatedAt'];
+  const hasRequiredStrings = requiredStrings.every((key) => typeof payload[key] === 'string' && String(payload[key]).trim().length > 0);
+  const hasId = typeof payload.id === 'number';
+
+  if (!hasRequiredStrings || !hasId) {
+    return null;
+  }
+
+  return {
+    id_alumno: String(payload.id_alumno),
+    nombre_alumno: String(payload.nombre_alumno),
+    id_padre: String(payload.id_padre),
+    id_tutor: String(payload.id_tutor),
+    RekognitionId: String(payload.RekognitionId),
+    id: Number(payload.id),
+    createdAt: String(payload.createdAt),
+    updatedAt: String(payload.updatedAt),
+  };
+}
+
+function parseAttendanceResponse(payload: Record<string, unknown>): AttendanceWebhookResponse | null {
+  const requiredStrings = ['id_alumno', 'estado', 'hora_ingreso', 'id_curso', 'fecha_asistencia', 'createdAt', 'updatedAt'];
+  const hasRequiredStrings = requiredStrings.every((key) => typeof payload[key] === 'string' && String(payload[key]).trim().length > 0);
+  const hasId = typeof payload.id === 'number';
+
+  if (!hasRequiredStrings || !hasId) {
+    return null;
+  }
+
+  return {
+    id_alumno: String(payload.id_alumno),
+    estado: String(payload.estado),
+    hora_ingreso: String(payload.hora_ingreso),
+    id_curso: String(payload.id_curso),
+    fecha_asistencia: String(payload.fecha_asistencia),
+    id: Number(payload.id),
+    createdAt: String(payload.createdAt),
+    updatedAt: String(payload.updatedAt),
+  };
+}
+
+function getStudentNameFromDuplicateMessage(message: string) {
+  const match = message.match(/Alumno\(a\)\s+(.+?)\s+ya\s+marco\s+asistencia/i);
+  return match?.[1]?.trim() ?? '';
+}
+
 export default function App() {
   const [step, setStep] = useState<AppStep>('setup');
   const [loading, setLoading] = useState(true);
@@ -83,6 +197,7 @@ export default function App() {
   const [selectedEnrollmentStudentId, setSelectedEnrollmentStudentId] = useState('');
   const [enrollmentStatus, setEnrollmentStatus] = useState<EnrollmentStatus>('idle');
   const [enrollmentMessage, setEnrollmentMessage] = useState('');
+  const [lastEnrollmentRecord, setLastEnrollmentRecord] = useState<EnrollmentWebhookResponse | null>(null);
 
   const [lastDetectedStudent, setLastDetectedStudent] = useState<Student | null>(null);
   const [attendanceStatus, setAttendanceStatus] = useState<AttendanceStatus>('idle');
@@ -141,9 +256,9 @@ export default function App() {
 
       try {
         const [teachersRes, coursesRes, studentsRes] = await Promise.all([
-          fetch(`${API_URL}/usuarios`),
-          fetch(`${API_URL}/cursos`),
-          fetch(`${API_URL}/alumnos`),
+          fetch(`${DATA_API_BASE}/usuarios`),
+          fetch(`${DATA_API_BASE}/cursos`),
+          fetch(`${DATA_API_BASE}/alumnos`),
         ]);
 
         if (!teachersRes.ok || !coursesRes.ok || !studentsRes.ok) {
@@ -176,6 +291,12 @@ export default function App() {
     }
 
     const video = videoRef.current;
+    await waitForVideoFrame(video);
+
+    if (video.videoWidth <= 0 || video.videoHeight <= 0) {
+      throw new Error('La cámara aún no entrega una imagen válida.');
+    }
+
     const canvas = canvasRef.current;
     canvas.width = video.videoWidth;
     canvas.height = video.videoHeight;
@@ -195,6 +316,7 @@ export default function App() {
     setEnrollmentStatus('idle');
     setEnrollmentMessage('');
     setSelectedEnrollmentStudentId('');
+    setLastEnrollmentRecord(null);
   };
 
   const submitEnrollment = async () => {
@@ -219,6 +341,10 @@ export default function App() {
       const imageDataUrl = await readFrameAsDataUrl();
       const imageBase64 = extractBase64(imageDataUrl);
 
+      if (imageBase64.length < 100) {
+        throw new Error('Base64 inválido o vacío antes de enviar a n8n');
+      }
+
       const response = await fetch(ENROLL_WEBHOOK_URL, {
         method: 'POST',
         headers: {
@@ -229,6 +355,7 @@ export default function App() {
           idAlumno: selectedEnrollmentStudentId,
           ID_ALUMNO: selectedEnrollmentStudentId,
           nombre_alumno: selectedStudent?.nombre_alumno,
+          foto_base64: imageBase64,
           imagen_base64: imageBase64,
           image_base64: imageBase64,
           mime_type: 'image/jpeg',
@@ -240,8 +367,17 @@ export default function App() {
         throw new Error('El webhook respondió con un error');
       }
 
+      const contentType = response.headers.get('content-type') ?? '';
+      let parsedEnrollment: EnrollmentWebhookResponse | null = null;
+
+      if (contentType.includes('application/json')) {
+        const payload = readMaybeObject(await response.json());
+        parsedEnrollment = parseEnrollmentResponse(payload);
+      }
+
       setEnrollmentStatus('success');
       setEnrollmentMessage('Estudiante registrado correctamente.');
+      setLastEnrollmentRecord(parsedEnrollment);
       setSelectedEnrollmentStudentId('');
 
       setTimeout(() => {
@@ -250,8 +386,11 @@ export default function App() {
       }, 2200);
     } catch (enrollmentError) {
       setEnrollmentStatus('error');
-      setEnrollmentMessage('No se pudo enviar la foto al webhook. Intenta de nuevo.');
-      console.error(enrollmentError);
+      setEnrollmentMessage(`No se pudo enviar la foto al webhook (${ENROLL_WEBHOOK_URL}).`);
+      console.error('Error enviando enrolamiento', {
+        webhook: ENROLL_WEBHOOK_URL,
+        error: enrollmentError,
+      });
     } finally {
       setIsCapturing(false);
     }
@@ -280,6 +419,7 @@ export default function App() {
           idDocente: selectedTeacher,
           id_curso: selectedCourse,
           idCurso: selectedCourse,
+          foto_base64: imageBase64,
           imagen_base64: imageBase64,
           image_base64: imageBase64,
           mime_type: 'image/jpeg',
@@ -293,12 +433,16 @@ export default function App() {
 
       const contentType = response.headers.get('content-type') ?? '';
       let payload: Record<string, unknown> = {};
+      let attendanceRecord: AttendanceWebhookResponse | null = null;
+      let duplicateMessage = '';
 
       if (contentType.includes('application/json')) {
         payload = readMaybeObject(await response.json());
+        attendanceRecord = parseAttendanceResponse(payload);
+        duplicateMessage = readFirstString(payload, ['message', 'mensaje']);
       }
 
-      const detectedId = readFirstString(payload, [
+      const detectedId = attendanceRecord?.id_alumno || readFirstString(payload, [
         'id_alumno',
         'idAlumno',
         'ID_ALUMNO',
@@ -307,12 +451,16 @@ export default function App() {
         'rekognition_id',
         'rekognitionId',
       ]);
-      const detectedName = readFirstString(payload, [
+      let detectedName = readFirstString(payload, [
         'nombre_alumno',
         'nombreAlumno',
         'alumno_nombre',
         'student_name',
       ]);
+
+      if (!detectedName && duplicateMessage) {
+        detectedName = getStudentNameFromDuplicateMessage(duplicateMessage);
+      }
 
       const detectedStudent = students.find(
         (student) =>
@@ -335,12 +483,22 @@ export default function App() {
       }
 
       setAttendanceStatus('success');
-      setAttendanceMessage('Asistencia registrada en n8n correctamente.');
+
+      if (attendanceRecord) {
+        setAttendanceMessage(`Asistencia registrada: ${attendanceRecord.id_alumno} (${attendanceRecord.estado}).`);
+      } else if (duplicateMessage) {
+        setAttendanceMessage(duplicateMessage);
+      } else {
+        setAttendanceMessage('Respuesta recibida desde n8n.');
+      }
     } catch (captureError) {
       setAttendanceStatus('error');
-      setAttendanceMessage('No se pudo registrar asistencia. Revisa el webhook de n8n.');
+      setAttendanceMessage(`No se pudo registrar asistencia (${ATTENDANCE_WEBHOOK_URL}).`);
       setLastDetectedStudent(null);
-      console.error('Error en el escaneo facial:', captureError);
+      console.error('Error en el escaneo facial', {
+        webhook: ATTENDANCE_WEBHOOK_URL,
+        error: captureError,
+      });
     } finally {
       setTimeout(() => setIsCapturing(false), 200);
     }
@@ -351,20 +509,25 @@ export default function App() {
     setError(null);
 
     try {
-      const studentsRes = await fetch(`${API_URL}/alumnos`);
-      if (!studentsRes.ok) {
-        throw new Error('Error al cargar lista de alumnos');
+      if (students.length === 0) {
+        const studentsRes = await fetch(`${DATA_API_BASE}/alumnos`);
+        if (!studentsRes.ok) {
+          throw new Error('Error al cargar lista de alumnos');
+        }
+
+        const studentsData = await studentsRes.json();
+        setStudents(studentsData);
       }
 
-      const studentsData = await studentsRes.json();
-      setStudents(studentsData);
       setLastDetectedStudent(null);
       setAttendanceStatus('idle');
       setAttendanceMessage('');
       setNotifyMessage('');
       setStep('scanning');
     } catch (sessionError) {
-      setError('Error al iniciar jornada. Intenta de nuevo.');
+      setStep('scanning');
+      setAttendanceMessage('No se pudo refrescar alumnos, pero la jornada se inició igual.');
+      setError(null);
       console.error(sessionError);
     } finally {
       setLoading(false);
@@ -402,8 +565,11 @@ export default function App() {
 
       setNotifyMessage('Notificación enviada a padres correctamente.');
     } catch (notifyError) {
-      setNotifyMessage('No se pudo notificar a padres. Verifica el webhook.');
-      console.error(notifyError);
+      setNotifyMessage(`No se pudo notificar a padres (${PARENTS_WEBHOOK_URL}).`);
+      console.error('Error notificando a padres', {
+        webhook: PARENTS_WEBHOOK_URL,
+        error: notifyError,
+      });
     } finally {
       setIsNotifyingParents(false);
     }
@@ -671,6 +837,18 @@ export default function App() {
                   </button>
                 </div>
               </div>
+
+                {lastEnrollmentRecord && (
+                  <div className="bg-white rounded-3xl p-4 shadow-xl border border-gray-100 text-xs text-gray-600 space-y-1">
+                    <p className="text-[10px] uppercase tracking-wider text-gray-400 font-bold">Respuesta n8n tipada</p>
+                    <p>ID alumno: {lastEnrollmentRecord.id_alumno}</p>
+                    <p>Nombre: {lastEnrollmentRecord.nombre_alumno}</p>
+                    <p>ID padre: {lastEnrollmentRecord.id_padre}</p>
+                    <p>ID tutor: {lastEnrollmentRecord.id_tutor}</p>
+                    <p>RekognitionId: {lastEnrollmentRecord.RekognitionId}</p>
+                    <p>Registro: #{lastEnrollmentRecord.id}</p>
+                  </div>
+                )}
             </motion.div>
           ) : (
             <motion.div
