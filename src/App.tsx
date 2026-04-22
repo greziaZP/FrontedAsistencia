@@ -24,6 +24,7 @@ const DATA_API_BASE = DATA_API_URL.replace(/\/$/, '');
 const ENROLL_WEBHOOK_URL = import.meta.env.VITE_ENROLL_WEBHOOK_URL ?? `${DATA_API_BASE}/enrolar`;
 const ATTENDANCE_WEBHOOK_URL = import.meta.env.VITE_ATTENDANCE_WEBHOOK_URL ?? `${DATA_API_BASE}/identificar`;
 const PARENTS_WEBHOOK_URL = import.meta.env.VITE_PARENTS_WEBHOOK_URL ?? `${DATA_API_BASE}/asistencia/padres`;
+const CLOSE_ATTENDANCE_WEBHOOK_URL = import.meta.env.VITE_CLOSE_ATTENDANCE_WEBHOOK_URL;
 
 interface Teacher {
   id_usuario: string;
@@ -202,8 +203,8 @@ export default function App() {
   const [lastDetectedStudent, setLastDetectedStudent] = useState<Student | null>(null);
   const [attendanceStatus, setAttendanceStatus] = useState<AttendanceStatus>('idle');
   const [attendanceMessage, setAttendanceMessage] = useState('');
-  const [isNotifyingParents, setIsNotifyingParents] = useState(false);
-  const [notifyMessage, setNotifyMessage] = useState('');
+  const [isClosingAttendance, setIsClosingAttendance] = useState(false);
+  const [closeAttendanceMessage, setCloseAttendanceMessage] = useState('');
   const [lastAttendanceResponse, setLastAttendanceResponse] = useState<Record<string, unknown> | null>(null);
   const [isCapturing, setIsCapturing] = useState(false);
 
@@ -402,8 +403,8 @@ export default function App() {
     setIsCapturing(true);
     setAttendanceStatus('sending');
     setAttendanceMessage('Enviando foto para reconocimiento...');
-    setNotifyMessage('');
     setLastAttendanceResponse(null);
+    setLastDetectedStudent(null);
 
     try {
       const imageDataUrl = await readFrameAsDataUrl();
@@ -485,12 +486,19 @@ export default function App() {
       setAttendanceStatus('success');
 
       if (attendanceRecord) {
-        setAttendanceMessage(`Asistencia registrada: ${attendanceRecord.id_alumno} (${attendanceRecord.estado}).`);
+        const courseName = courses.find((c) => c.id_curso === selectedCourse)?.nombre_curso || selectedCourse;
+        setAttendanceMessage(`✓ ${detectedName || attendanceRecord.id_alumno} en ${courseName} (${attendanceRecord.estado})`);
       } else if (duplicateMessage) {
-        setAttendanceMessage(duplicateMessage);
+        const courseName = courses.find((c) => c.id_curso === selectedCourse)?.nombre_curso || selectedCourse;
+        const studentNameFromMessage = getStudentNameFromDuplicateMessage(duplicateMessage);
+        setAttendanceMessage(`${studentNameFromMessage} registrado en ${courseName}`);
       } else {
         setAttendanceMessage('Respuesta recibida desde n8n.');
       }
+
+      window.setTimeout(() => {
+        setAttendanceStatus('idle');
+      }, 1700);
     } catch (captureError) {
       setAttendanceStatus('error');
       setAttendanceMessage(`No se pudo registrar asistencia (${ATTENDANCE_WEBHOOK_URL}).`);
@@ -522,7 +530,6 @@ export default function App() {
       setLastDetectedStudent(null);
       setAttendanceStatus('idle');
       setAttendanceMessage('');
-      setNotifyMessage('');
       setStep('scanning');
     } catch (sessionError) {
       setStep('scanning');
@@ -534,44 +541,42 @@ export default function App() {
     }
   };
 
-  const notifyParents = async () => {
-    if (!lastDetectedStudent || isNotifyingParents) {
+  const closeAttendance = async () => {
+    if (isClosingAttendance) {
       return;
     }
 
-    setIsNotifyingParents(true);
-    setNotifyMessage('Enviando notificación a padres...');
+    setIsClosingAttendance(true);
+    setCloseAttendanceMessage('Cerrando asistencia y notificando...');
 
     try {
-      const response = await fetch(PARENTS_WEBHOOK_URL, {
+      const response = await fetch(CLOSE_ATTENDANCE_WEBHOOK_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          id_alumno: lastDetectedStudent.id_alumno,
-          idAlumno: lastDetectedStudent.id_alumno,
-          nombre_alumno: lastDetectedStudent.nombre_alumno,
           id_docente: selectedTeacher,
+          idDocente: selectedTeacher,
           id_curso: selectedCourse,
-          contexto_asistencia: lastAttendanceResponse,
+          idCurso: selectedCourse,
           origen: 'frontend-asistencia',
         }),
       });
 
       if (!response.ok) {
-        throw new Error('Webhook de padres respondió con error');
+        throw new Error('Webhook de cierre respondió con error');
       }
 
-      setNotifyMessage('Notificación enviada a padres correctamente.');
-    } catch (notifyError) {
-      setNotifyMessage(`No se pudo notificar a padres (${PARENTS_WEBHOOK_URL}).`);
-      console.error('Error notificando a padres', {
-        webhook: PARENTS_WEBHOOK_URL,
-        error: notifyError,
+      setCloseAttendanceMessage('Asistencia cerrada correctamente.');
+    } catch (closeError) {
+      setCloseAttendanceMessage(`No se pudo cerrar asistencia (${CLOSE_ATTENDANCE_WEBHOOK_URL}).`);
+      console.error('Error cerrando asistencia', {
+        webhook: CLOSE_ATTENDANCE_WEBHOOK_URL,
+        error: closeError,
       });
     } finally {
-      setIsNotifyingParents(false);
+      setIsClosingAttendance(false);
     }
   };
 
@@ -579,13 +584,10 @@ export default function App() {
     stopStream(streamRef.current);
     streamRef.current = null;
     setStep('setup');
-    setSelectedTeacher('');
-    setSelectedCourse('');
     setSelectedEnrollmentStudentId('');
     setLastDetectedStudent(null);
     setAttendanceStatus('idle');
     setAttendanceMessage('');
-    setNotifyMessage('');
   };
 
   const readyToEnroll = selectedEnrollmentStudentId.length > 0;
@@ -722,6 +724,19 @@ export default function App() {
                     ))}
                   </select>
                 </div>
+
+                  <div className="pt-2">
+                    <button
+                      disabled={isClosingAttendance}
+                      onClick={() => void closeAttendance()}
+                      className="w-full bg-red-600 hover:bg-red-700 disabled:opacity-30 disabled:grayscale text-white font-black py-3 rounded-2xl shadow-lg shadow-red-600/20 transition-all active:scale-95"
+                    >
+                      {isClosingAttendance ? 'Enviando' : 'Notificar Inasistencias'}
+                    </button>
+                    {closeAttendanceMessage && (
+                      <p className="text-xs text-gray-500 mt-2 text-center">{closeAttendanceMessage}</p>
+                    )}
+                  </div>
               </div>
             </motion.div>
           ) : step === 'enrolling' ? (
@@ -944,22 +959,6 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 gap-4 w-full">
-                  <button
-                    disabled={!lastDetectedStudent || isNotifyingParents}
-                    onClick={() => void notifyParents()}
-                    className={`py-5 rounded-2xl shadow-lg font-black flex flex-col items-center justify-center gap-1 transition-all active:scale-95 ${
-                      lastDetectedStudent
-                        ? 'bg-institucional-blue text-white shadow-institucional-blue/30'
-                        : 'bg-gray-200 text-gray-400 cursor-not-allowed'
-                    }`}
-                  >
-                    {isNotifyingParents ? <Loader2 className="w-6 h-6 animate-spin" /> : <Check className="w-6 h-6" />}
-                    <span className="text-xs">ENVIAR ASISTENCIA A PADRES</span>
-                  </button>
-                </div>
-
-                {notifyMessage && <p className="text-xs text-center text-gray-500 w-full mt-1">{notifyMessage}</p>}
               </div>
 
               <div className="flex items-center justify-between px-4 pb-4">
