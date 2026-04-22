@@ -21,6 +21,8 @@ import { AnimatePresence, motion } from 'motion/react';
 
 const API_URL = import.meta.env.VITE_API_BASE_URL ?? '/api';
 const ENROLL_WEBHOOK_URL = `${API_URL.replace(/\/$/, '')}/enrolar`;
+const ATTENDANCE_WEBHOOK_URL = `${API_URL.replace(/\/$/, '')}/asistencia`;
+const PARENTS_WEBHOOK_URL = `${API_URL.replace(/\/$/, '')}/asistencia/padres`;
 
 interface Teacher {
   id_usuario: string;
@@ -42,6 +44,7 @@ interface Student {
 
 type AppStep = 'setup' | 'enrolling' | 'scanning';
 type EnrollmentStatus = 'idle' | 'sending' | 'success' | 'error';
+type AttendanceStatus = 'idle' | 'sending' | 'success' | 'error';
 
 function stopStream(stream: MediaStream | null) {
   stream?.getTracks().forEach((track) => track.stop());
@@ -50,6 +53,20 @@ function stopStream(stream: MediaStream | null) {
 function extractBase64(dataUrl: string) {
   const separatorIndex = dataUrl.indexOf(',');
   return separatorIndex >= 0 ? dataUrl.slice(separatorIndex + 1) : dataUrl;
+}
+
+function readMaybeObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+}
+
+function readFirstString(payload: Record<string, unknown>, keys: string[]) {
+  for (const key of keys) {
+    const raw = payload[key];
+    if (typeof raw === 'string' && raw.trim().length > 0) {
+      return raw.trim();
+    }
+  }
+  return '';
 }
 
 export default function App() {
@@ -63,13 +80,16 @@ export default function App() {
 
   const [selectedTeacher, setSelectedTeacher] = useState('');
   const [selectedCourse, setSelectedCourse] = useState('');
-  const [enrollmentName, setEnrollmentName] = useState('');
-  const [enrollmentId, setEnrollmentId] = useState('');
+  const [selectedEnrollmentStudentId, setSelectedEnrollmentStudentId] = useState('');
   const [enrollmentStatus, setEnrollmentStatus] = useState<EnrollmentStatus>('idle');
   const [enrollmentMessage, setEnrollmentMessage] = useState('');
 
   const [lastDetectedStudent, setLastDetectedStudent] = useState<Student | null>(null);
-  const [attendanceStatus, setAttendanceStatus] = useState<'idle' | 'present' | 'absent'>('idle');
+  const [attendanceStatus, setAttendanceStatus] = useState<AttendanceStatus>('idle');
+  const [attendanceMessage, setAttendanceMessage] = useState('');
+  const [isNotifyingParents, setIsNotifyingParents] = useState(false);
+  const [notifyMessage, setNotifyMessage] = useState('');
+  const [lastAttendanceResponse, setLastAttendanceResponse] = useState<Record<string, unknown> | null>(null);
   const [isCapturing, setIsCapturing] = useState(false);
 
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -120,22 +140,25 @@ export default function App() {
       setError(null);
 
       try {
-        const [teachersRes, coursesRes] = await Promise.all([
+        const [teachersRes, coursesRes, studentsRes] = await Promise.all([
           fetch(`${API_URL}/usuarios`),
           fetch(`${API_URL}/cursos`),
+          fetch(`${API_URL}/alumnos`),
         ]);
 
-        if (!teachersRes.ok || !coursesRes.ok) {
+        if (!teachersRes.ok || !coursesRes.ok || !studentsRes.ok) {
           throw new Error('Error al cargar datos iniciales');
         }
 
-        const [teachersData, coursesData] = await Promise.all([
+        const [teachersData, coursesData, studentsData] = await Promise.all([
           teachersRes.json(),
           coursesRes.json(),
+          studentsRes.json(),
         ]);
 
         setTeachers(teachersData);
         setCourses(coursesData);
+        setStudents(studentsData);
       } catch (initialError) {
         setError('No se pudo conectar con el servidor. Verifica tu conexión.');
         console.error(initialError);
@@ -171,6 +194,7 @@ export default function App() {
     setError(null);
     setEnrollmentStatus('idle');
     setEnrollmentMessage('');
+    setSelectedEnrollmentStudentId('');
   };
 
   const submitEnrollment = async () => {
@@ -178,13 +202,13 @@ export default function App() {
       return;
     }
 
-    const studentName = enrollmentName.trim();
-
-    if (!studentName) {
+    if (!selectedEnrollmentStudentId) {
       setEnrollmentStatus('error');
-      setEnrollmentMessage('Escribe el nombre del estudiante antes de registrar la foto.');
+      setEnrollmentMessage('Selecciona un alumno antes de registrar la foto.');
       return;
     }
+
+    const selectedStudent = students.find((student) => student.id_alumno === selectedEnrollmentStudentId);
 
     setEnrollmentStatus('sending');
     setEnrollmentMessage('');
@@ -201,9 +225,12 @@ export default function App() {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          nombre_alumno: studentName,
-          id_alumno: enrollmentId.trim() || undefined,
+          id_alumno: selectedEnrollmentStudentId,
+          idAlumno: selectedEnrollmentStudentId,
+          ID_ALUMNO: selectedEnrollmentStudentId,
+          nombre_alumno: selectedStudent?.nombre_alumno,
           imagen_base64: imageBase64,
+          image_base64: imageBase64,
           mime_type: 'image/jpeg',
           origen: 'frontend-asistencia',
         }),
@@ -215,18 +242,7 @@ export default function App() {
 
       setEnrollmentStatus('success');
       setEnrollmentMessage('Estudiante registrado correctamente.');
-      setEnrollmentName('');
-      setEnrollmentId('');
-      const trimmedEnrollmentId = enrollmentId.trim();
-      setStudents((currentStudents) => {
-        const nextStudent: Student = {
-          id_alumno: trimmedEnrollmentId || studentName,
-          nombre_alumno: studentName,
-          RekognitionId: null,
-        };
-
-        return [nextStudent, ...currentStudents];
-      });
+      setSelectedEnrollmentStudentId('');
 
       setTimeout(() => {
         setEnrollmentStatus('idle');
@@ -242,18 +258,88 @@ export default function App() {
   };
 
   const captureAttendancePhoto = async () => {
-    if (students.length === 0) return;
+    if (!selectedTeacher || !selectedCourse || attendanceStatus === 'sending') return;
 
     setIsCapturing(true);
-    setAttendanceStatus('idle');
+    setAttendanceStatus('sending');
+    setAttendanceMessage('Enviando foto para reconocimiento...');
+    setNotifyMessage('');
+    setLastAttendanceResponse(null);
 
     try {
-      await readFrameAsDataUrl();
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      const imageDataUrl = await readFrameAsDataUrl();
+      const imageBase64 = extractBase64(imageDataUrl);
 
-      const randomIndex = Math.floor(Math.random() * students.length);
-      setLastDetectedStudent(students[randomIndex]);
+      const response = await fetch(ATTENDANCE_WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          id_docente: selectedTeacher,
+          idDocente: selectedTeacher,
+          id_curso: selectedCourse,
+          idCurso: selectedCourse,
+          imagen_base64: imageBase64,
+          image_base64: imageBase64,
+          mime_type: 'image/jpeg',
+          origen: 'frontend-asistencia',
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('El webhook de asistencia respondió con error');
+      }
+
+      const contentType = response.headers.get('content-type') ?? '';
+      let payload: Record<string, unknown> = {};
+
+      if (contentType.includes('application/json')) {
+        payload = readMaybeObject(await response.json());
+      }
+
+      const detectedId = readFirstString(payload, [
+        'id_alumno',
+        'idAlumno',
+        'ID_ALUMNO',
+        'alumno_id',
+        'student_id',
+        'rekognition_id',
+        'rekognitionId',
+      ]);
+      const detectedName = readFirstString(payload, [
+        'nombre_alumno',
+        'nombreAlumno',
+        'alumno_nombre',
+        'student_name',
+      ]);
+
+      const detectedStudent = students.find(
+        (student) =>
+          student.id_alumno === detectedId ||
+          student.RekognitionId === detectedId,
+      );
+
+      setLastAttendanceResponse(payload);
+
+      if (detectedStudent) {
+        setLastDetectedStudent(detectedStudent);
+      } else if (detectedId || detectedName) {
+        setLastDetectedStudent({
+          id_alumno: detectedId || 'sin-id',
+          nombre_alumno: detectedName || 'Alumno detectado',
+          RekognitionId: detectedId || null,
+        });
+      } else {
+        setLastDetectedStudent(null);
+      }
+
+      setAttendanceStatus('success');
+      setAttendanceMessage('Asistencia registrada en n8n correctamente.');
     } catch (captureError) {
+      setAttendanceStatus('error');
+      setAttendanceMessage('No se pudo registrar asistencia. Revisa el webhook de n8n.');
+      setLastDetectedStudent(null);
       console.error('Error en el escaneo facial:', captureError);
     } finally {
       setTimeout(() => setIsCapturing(false), 200);
@@ -272,6 +358,10 @@ export default function App() {
 
       const studentsData = await studentsRes.json();
       setStudents(studentsData);
+      setLastDetectedStudent(null);
+      setAttendanceStatus('idle');
+      setAttendanceMessage('');
+      setNotifyMessage('');
       setStep('scanning');
     } catch (sessionError) {
       setError('Error al iniciar jornada. Intenta de nuevo.');
@@ -281,17 +371,42 @@ export default function App() {
     }
   };
 
-  const handleMarkAttendance = (isAbsent: boolean) => {
-    if (!lastDetectedStudent && !isAbsent) {
+  const notifyParents = async () => {
+    if (!lastDetectedStudent || isNotifyingParents) {
       return;
     }
 
-    setAttendanceStatus(isAbsent ? 'absent' : 'present');
+    setIsNotifyingParents(true);
+    setNotifyMessage('Enviando notificación a padres...');
 
-    setTimeout(() => {
-      setAttendanceStatus('idle');
-      setLastDetectedStudent(null);
-    }, 1500);
+    try {
+      const response = await fetch(PARENTS_WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          id_alumno: lastDetectedStudent.id_alumno,
+          idAlumno: lastDetectedStudent.id_alumno,
+          nombre_alumno: lastDetectedStudent.nombre_alumno,
+          id_docente: selectedTeacher,
+          id_curso: selectedCourse,
+          contexto_asistencia: lastAttendanceResponse,
+          origen: 'frontend-asistencia',
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Webhook de padres respondió con error');
+      }
+
+      setNotifyMessage('Notificación enviada a padres correctamente.');
+    } catch (notifyError) {
+      setNotifyMessage('No se pudo notificar a padres. Verifica el webhook.');
+      console.error(notifyError);
+    } finally {
+      setIsNotifyingParents(false);
+    }
   };
 
   const logout = () => {
@@ -300,11 +415,14 @@ export default function App() {
     setStep('setup');
     setSelectedTeacher('');
     setSelectedCourse('');
+    setSelectedEnrollmentStudentId('');
     setLastDetectedStudent(null);
     setAttendanceStatus('idle');
+    setAttendanceMessage('');
+    setNotifyMessage('');
   };
 
-  const readyToEnroll = enrollmentName.trim().length > 0;
+  const readyToEnroll = selectedEnrollmentStudentId.length > 0;
 
   if (loading && step === 'setup' && teachers.length === 0) {
     return (
@@ -452,30 +570,26 @@ export default function App() {
                   <p className="text-xs uppercase tracking-[0.2em] text-gray-400 font-bold">Registro inicial</p>
                   <h2 className="text-2xl font-black text-institucional-blue mt-1">Registrar estudiante</h2>
                   <p className="text-sm text-gray-500 mt-2">
-                    Captura la foto del rostro.
+                      Selecciona el alumno y captura la foto del rostro.
                   </p>
                 </div>
 
-                <div className="space-y-3">
-                  <div>
-                    <label className="block text-sm font-bold text-institucional-blue mb-2">Nombre del estudiante</label>
-                    <input
-                      value={enrollmentName}
-                      onChange={(e) => setEnrollmentName(e.target.value)}
-                      placeholder="Ej. Ana Pérez"
-                      className="w-full bg-white border-2 border-institucional-blue/10 rounded-2xl p-4 shadow-sm focus:border-institucional-blue focus:ring-2 focus:ring-institucional-blue/20 outline-none transition-all"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-sm font-bold text-institucional-blue mb-2">Código o ID del alumno</label>
-                    <input
-                      value={enrollmentId}
-                      onChange={(e) => setEnrollmentId(e.target.value)}
-                      placeholder="Opcional"
-                      className="w-full bg-white border-2 border-institucional-blue/10 rounded-2xl p-4 shadow-sm focus:border-institucional-blue focus:ring-2 focus:ring-institucional-blue/20 outline-none transition-all"
-                    />
-                  </div>
+                  <div className="space-y-2">
+                    <label className="flex items-center gap-2 text-sm font-bold text-institucional-blue ml-1">
+                      <Users className="w-4 h-4" /> Alumno
+                    </label>
+                    <select
+                      value={selectedEnrollmentStudentId}
+                      onChange={(e) => setSelectedEnrollmentStudentId(e.target.value)}
+                      className="w-full bg-white border-2 border-institucional-blue/10 rounded-2xl p-4 shadow-sm focus:border-institucional-blue focus:ring-2 focus:ring-institucional-blue/20 outline-none transition-all appearance-none cursor-pointer"
+                    >
+                      <option value="">Seleccionar Alumno</option>
+                      {students.map((student) => (
+                        <option key={student.id_alumno} value={student.id_alumno}>
+                          {student.nombre_alumno}
+                        </option>
+                      ))}
+                    </select>
                 </div>
               </div>
 
@@ -604,13 +718,13 @@ export default function App() {
                 />
 
                 <AnimatePresence>
-                  {attendanceStatus !== 'idle' && (
+                  {(attendanceStatus === 'success' || attendanceStatus === 'error') && (
                     <motion.div
                       initial={{ opacity: 0 }}
                       animate={{ opacity: 1 }}
                       exit={{ opacity: 0 }}
                       className={`absolute inset-0 flex flex-col items-center justify-center z-20 backdrop-blur-sm ${
-                        attendanceStatus === 'present' ? 'bg-green-600/30' : 'bg-red-600/30'
+                        attendanceStatus === 'success' ? 'bg-green-600/30' : 'bg-red-600/30'
                       }`}
                     >
                       <motion.div
@@ -618,7 +732,7 @@ export default function App() {
                         animate={{ scale: 1, rotate: 0 }}
                         className="bg-white p-6 rounded-full shadow-2xl"
                       >
-                        {attendanceStatus === 'present' ? (
+                        {attendanceStatus === 'success' ? (
                           <Check className="w-16 h-16 text-green-600 stroke-[4px]" />
                         ) : (
                           <X className="w-16 h-16 text-red-600 stroke-[4px]" />
@@ -629,7 +743,7 @@ export default function App() {
                         animate={{ y: 0, opacity: 1 }}
                         className="mt-4 text-white font-black text-xl drop-shadow-md"
                       >
-                        {attendanceStatus === 'present' ? '¡ASISTENCIA REGISTRADA!' : 'INASISTENCIA MARCADA'}
+                        {attendanceStatus === 'success' ? '¡ASISTENCIA REGISTRADA!' : 'ERROR DE REGISTRO'}
                       </motion.p>
                     </motion.div>
                   )}
@@ -648,31 +762,26 @@ export default function App() {
                     ) : (
                       <p className="text-gray-400 italic">Toca la cámara para escanear</p>
                     )}
+                    <p className="text-xs text-gray-500 mt-1">{attendanceMessage || 'La asistencia se guarda automáticamente en n8n.'}</p>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4 w-full">
+                <div className="grid grid-cols-1 gap-4 w-full">
                   <button
-                    disabled={!lastDetectedStudent || attendanceStatus !== 'idle'}
-                    onClick={() => handleMarkAttendance(false)}
+                    disabled={!lastDetectedStudent || isNotifyingParents}
+                    onClick={() => void notifyParents()}
                     className={`py-5 rounded-2xl shadow-lg font-black flex flex-col items-center justify-center gap-1 transition-all active:scale-95 ${
                       lastDetectedStudent
-                        ? 'bg-green-600 text-white shadow-green-600/30'
+                        ? 'bg-institucional-blue text-white shadow-institucional-blue/30'
                         : 'bg-gray-200 text-gray-400 cursor-not-allowed'
                     }`}
                   >
-                    <Check className="w-6 h-6" />
-                    <span className="text-xs">ASISTENCIA</span>
-                  </button>
-                  <button
-                    disabled={attendanceStatus !== 'idle'}
-                    onClick={() => handleMarkAttendance(true)}
-                    className="bg-red-600 hover:bg-red-700 disabled:opacity-30 disabled:grayscale text-white py-5 rounded-2xl shadow-lg shadow-red-600/30 font-black flex flex-col items-center justify-center gap-1 transition-all active:scale-95"
-                  >
-                    <X className="w-6 h-6" />
-                    <span className="text-xs">INASISTENCIA</span>
+                    {isNotifyingParents ? <Loader2 className="w-6 h-6 animate-spin" /> : <Check className="w-6 h-6" />}
+                    <span className="text-xs">ENVIAR ASISTENCIA A PADRES</span>
                   </button>
                 </div>
+
+                {notifyMessage && <p className="text-xs text-center text-gray-500 w-full mt-1">{notifyMessage}</p>}
               </div>
 
               <div className="flex items-center justify-between px-4 pb-4">
